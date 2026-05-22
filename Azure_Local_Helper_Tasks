@@ -1,0 +1,524 @@
+# Azure Local (Edge) Helper Implementation Tasks
+
+## Overview
+This document contains the tasks for implementing Azure Local (formerly Azure Stack HCI / Edge) support for VM lifecycle management operations. The Azure Local environment requires custom REST API implementations because the Azure Python SDK's `ComputeManagementClient` does not support HybridCompute resources.
+
+## Prerequisites
+- Azure Local cluster with Arc-enabled servers
+- Service Principal authentication (credentials shared separately)
+- Access to Azure Resource Graph for query operations
+- Test VMs: `name` and `name` in subscription `value`, resource group `value`
+
+## API Documentation Reference
+- **Azure Stack HCI Virtual Machine Instances REST API**: https://learn.microsoft.com/en-us/rest/api/stackhci/virtual-machine-instances?view=rest-stackhci-2024-01-01
+- Use this documentation to research correct endpoints, request/response structures, and API patterns
+
+## Architecture Notes
+- **Authentication**: Service Principal (tenant_id, client_id, client_secret)
+- **REST API Base**: Use Azure REST API endpoints for HybridCompute
+- **Resource Graph**: Use Azure Resource Graph API for GET operations where supported
+- **Polling**: Long-running operations (LROs) require manual polling (no built-in wait support)
+- **Resource URI Structure**: Azure Local VMs use standard Azure resource URIs:
+  - Format: `/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.HybridCompute/machines/{machineName}`
+  - Example: `/subscriptions/5xxx----/resourcegroups/coxxx-----prod/providers/microsoft.hybridcompute/machines/nxxx---`
+  - VM operations use: `{resourceUri}/providers/Microsoft.AzureStackHCI/virtualMachineInstances/default/{operation}`
+- **API Version**: Use `api-version=2024-01-01` for AzureStackHCI operations
+
+## Implementation Pattern
+All methods should follow the existing helper pattern:
+1. Initialize with config dict (tenant_id, client_id, client_secret, base_url, default_subscription_id)
+2. Use ClientSecretCredential for authentication
+3. Raise `models.HelperError` with `models.ErrorDataBase` for exceptions
+4. Return dictionaries with consistent structure
+5. Use `sk_logging.log` for debug/info logging
+
+## Test Pattern Reference
+Follow the test pattern from `tests/integration/test_sailpoint_integration.py` for integration tests.
+**Note**: Integration tests only - no unit tests required.
+
+---
+
+## TASK 1: Setup Azure Local Helper Class Foundation
+
+**Task Category**: Foundation & Authentication
+
+
+### Description
+Create the base Azure Local Helper class with authentication and initialization. This provides the foundation for all subsequent VM operation methods.
+
+### Acceptance Criteria
+1. **File Creation**:
+   - Create `_automation_helpers/sk_azure_local.py`
+   - Create `_automation_helpers/models.py` entry for `AzureLocalConfig`
+   - Add imports: `requests`, `ClientSecretCredential`, `models`, `log`
+
+2. **Class Structure**:
+   - `AzureLocalHelper` class with `__init__(self, config: dict)`
+   - Config includes: tenant_id, client_id, client_secret, base_url, default_subscription_id
+
+3. **Authentication Implementation**:
+   - Initialize `ClientSecretCredential` in `__init__`
+   - Implement `_get_access_token()` method to retrieve bearer token
+   - Handle token refresh automatically
+   - Raise `models.HelperError` on auth failure
+
+4. **Request Helper Method**:
+   - Implement `_make_request(self, method: str, url: str, json_data: dict = None) -> dict`
+   - Supports GET, POST, PUT, DELETE, PATCH methods
+   - Handles authentication token injection and error handling
+
+### Testing Requirements
+- Integration test for initialization and authentication
+- Test with provided Service Principal credentials
+- Follow SailPoint test pattern
+
+### Definition of Done
+- [ ] Class created with proper docstrings
+- [ ] Authentication working with Service Principal
+- [ ] `_make_request` helper handles all HTTP methods
+- [ ] Error handling raises `models.HelperError`
+- [ ] Integration tests passing
+- [ ] Code reviewed and approved
+
+---
+
+## TASK 2: Implement vm_exists Method
+
+**Task Category**: Core VM Query Operations
+
+
+### Description
+Check if a VM exists by name using Azure Resource Graph query.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `vm_exists(self, vm_name: str) -> bool`
+   - Returns `True` if VM exists, `False` otherwise
+
+2. **Implementation Requirements**:
+   - Resource Graph endpoint: `https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01`
+   - Query: `Resources | where type =~ 'microsoft.hybridcompute/machines' | where name == '{vm_name}'`
+   - Return boolean based on result count
+   - Handle API errors gracefully (404 returns False)
+
+### Testing Requirements
+- Integration test with test VM: `name`
+- Test with non-existent VM name
+- Follow existingSailPoint test pattern
+
+### Definition of Done
+- [ ] Method implemented and working
+- [ ] Uses Resource Graph API correctly
+- [ ] Returns boolean as expected
+- [ ] Integration tests passing
+
+---
+
+## TASK 3: Implement vm_exists_specific Method
+
+**Task Category**: Core VM Query Operations
+
+
+### Description
+Check if a VM exists with specific subscription and resource group using direct REST API call.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `vm_exists_specific(self, vm_name: str, subscription_id: str, resource_group_name: str) -> bool`
+   - Return `True` if 200, `False` if 404
+
+2. **Implementation Requirements**:
+   - URL: `https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.HybridCompute/machines/{machineName}?api-version=2024-01-01`
+   - Return `True` for 200 status, `False` for 404
+   - Raise error for other status codes
+
+### Testing Requirements
+- Integration test with test VM and subscription/resource group
+- Test with non-existent VM (should return False)
+- Follow SailPoint test pattern
+
+### Definition of Done
+- [ ] Method implemented with correct parameters
+- [ ] Boolean return based on status code
+- [ ] Integration tests passing
+
+---
+
+## TASK 4: Implement get_vm_details Method
+
+**Task Category**: Core VM Query Operations
+
+
+### Description
+Retrieve comprehensive VM details using Azure Resource Graph.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `get_vm_details(self, vm_name: str) -> dict`
+   - Returns VM configuration, power state, and metadata
+   - Raises `HelperError` if VM not found or multiple VMs with same name
+
+2. **Return Structure**:
+   - Dictionary with: id, name, type, location, properties, tags
+   - Properties include: status, agentVersion, osName, osVersion, vmId, machineFqdn
+
+3. **Implementation Requirements**:
+   - Use Resource Graph API
+   - Query: `Resources | where type =~ 'microsoft.hybridcompute/machines' | where name == '{vm_name}'`
+   - Validate exactly 1 result (raise error if 0 or >1)
+
+### Testing Requirements
+- Integration test with test VM: ``
+- Validate return structure
+- Follow existingSailPoint test pattern
+
+### Definition of Done
+- [ ] Method returns dict with VM details
+- [ ] Error handling for 0 and >1 results
+- [ ] Integration tests passing
+
+---
+
+## TASK 5: Implement get_vm_details_specific Method
+
+**Task Category**: Core VM Query Operations
+
+
+### Description
+Get VM details when subscription and resource group are known using direct REST API.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `get_vm_details_specific(self, vm_name: str, subscription_id: str, resource_group_name: str) -> dict`
+   - Returns same structure as `get_vm_details`
+
+2. **Implementation Requirements**:
+   - URL: `https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.HybridCompute/machines/{machineName}?api-version=2024-01-01`
+   - Parse JSON response and return complete machine object
+
+### Testing Requirements
+- Integration test with test VM and location
+- Validate structure matches `get_vm_details`
+- Follow SailPoint test pattern
+
+### Definition of Done
+- [ ] Method implemented with direct REST API
+- [ ] Returns same structure as get_vm_details
+- [ ] Integration tests passing
+
+---
+
+## TASK 6: Implement get_vm_power_state Method
+
+**Task Category**: VM Power Operations
+
+
+### Description
+Get the current power state of an Azure Local VM by analyzing the actual JSON response structure from the Azure Local REST API.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `get_vm_power_state(self, vm_name: str, subscription_id: str, resource_group_name: str) -> str`
+   - Returns power state: 'running', 'stopped', 'deallocated', or ''
+
+2. **Implementation Requirements**:
+   - **Research Required**: Analyze the actual JSON response from the Azure Local VM API to determine the correct path to power state information
+   - Make GET request to the HybridCompute machine resource and/or AzureStackHCI virtualMachineInstance resource
+   - Parse the JSON response to extract power state information (location and structure may vary)
+   - Map discovered state values to standard power states: 'running', 'stopped', 'deallocated', or '' (empty string if unknown)
+   - Document the actual JSON structure and parsing logic used
+
+### Testing Requirements
+- Integration test with test VM
+- Test returns valid power state string
+- Follow existingSailPoint test pattern
+
+### Definition of Done
+- [ ] Method returns standardized power state string
+- [ ] Actual JSON structure analyzed and parsing implemented correctly
+- [ ] State mapping documented in code comments
+- [ ] Integration tests passing
+
+---
+
+## TASK 7: Implement start_vm Method
+
+**Task Category**: VM Power Operations
+**Story Points**: 4
+
+### Description
+Start an Azure Local VM using REST API with manual polling for operation completion.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `async start_vm(self, vm_name: str, subscription_id: str, resource_group_name: str, wait_time: int = 300) -> None`
+   - Raises `models.HelperError` on failure
+
+2. **Implementation Requirements**:
+   - Construct resource URI: `/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.HybridCompute/machines/{machineName}`
+   - POST to: `{resourceUri}/providers/Microsoft.AzureStackHCI/virtualMachineInstances/default/start?api-version=2024-01-01`
+   - Poll power state every 10 seconds
+   - Exit when state == "running"
+   - Handle already running VM gracefully
+
+### Testing Requirements
+- Integration test with test VM
+- Ensure VM is stopped first, then start and verify
+- Follow SailPoint test pattern
+
+### Definition of Done
+- [ ] Start operation implemented
+- [ ] Polling logic working correctly
+- [ ] Integration tests passing
+
+---
+
+## TASK 8: Implement stop_vm Method
+
+**Task Category**: VM Power Operations
+
+
+### Description
+Stop (deallocate) an Azure Local VM using REST API with manual polling support.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `async stop_vm(self, vm_name: str, subscription_id: str, resource_group_name: str, wait_time: int = 300) -> None`
+   - Raises `models.HelperError` on failure
+
+2. **Implementation Requirements**:
+   - Construct resource URI: `/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.HybridCompute/machines/{machineName}`
+   - POST to: `{resourceUri}/providers/Microsoft.AzureStackHCI/virtualMachineInstances/default/stop?api-version=2024-01-01`
+   - Poll until state is "stopped" or "deallocated" (to be verified how it is in Azure Local)
+   - Poll interval: 10 seconds
+   - Handle already stopped VM gracefully
+
+### Testing Requirements
+- Integration test with test VM
+- Verify VM stops successfully
+- Follow SailPoint test pattern
+
+### Definition of Done
+- [ ] Stop operation implemented
+- [ ] Polling works correctly
+- [ ] Integration tests passing
+
+---
+
+## TASK 9: Implement resize_vm Method
+
+**Task Category**: VM Resize Operations
+
+
+### Description
+Resize an Azure Local VM by changing CPU and memory allocation. Azure Local doesn't use SKUs - it uses direct memory (MB) and CPU (cores) allocation.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `async resize_vm(self, vm_name: str, subscription_id: str, resource_group_name: str, memory_mb: int, cpu_count: int, wait_time: int = 600) -> None`
+   - Raises `HelperError` if VM is running
+
+2. **Implementation Requirements**:
+   - **Research Required**: Analyze the Azure Local API to determine the correct method (PATCH/PUT), endpoint, and request body structure for updating VM hardware configuration
+   - **Pre-check**: Verify VM is stopped/deallocated before attempting resize
+   - Determine the correct API endpoint
+   - Research the correct request body structure for updating memory and CPU allocations
+   - Implement polling to verify the hardware changes have been applied
+   - Timeout after `wait_time` seconds
+   - Document the actual API structure and parameters used
+
+3. **Validation**:
+   - Check power state before resize
+   - Raise error if VM is running
+
+### Testing Requirements
+- Integration test with test VM
+- Stop VM first, then resize, verify new specs
+- Follow SailPoint test pattern
+
+### Definition of Done
+- [ ] Resize operation implemented with memory/CPU parameters
+- [ ] Actual API structure researched and documented in code comments
+- [ ] Pre-check prevents running VM resize
+- [ ] Polling works correctly
+- [ ] Integration tests passing
+
+---
+
+## TASK 10: Implement resize_disk Method
+
+**Task Category**: VM Disk Operations
+
+
+### Description
+Resize an Azure Local VM disk by changing its size. Azure Local disks don't have type differentiation (SSD/HDD) - only size can be modified.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `async resize_disk(self, disk_name: str, subscription_id: str, resource_group_name: str, new_size_gb: int, wait_time: int = 600) -> None`
+   - Raises `HelperError` if disk is attached to a running VM
+
+2. **Implementation Requirements**:
+   - **Research Required**: Analyze the Azure Local API to determine the correct method, endpoint, and request body structure for disk resizing
+   - Determine the disk resource provider path
+   - Research the API version and request body structure for updating disk size
+   - Implement validation that new size is larger than current size (disks can only grow, not shrink)
+   - Check if disk is attached to a VM and verify that VM is stopped
+   - Implement polling to verify the resize operation has completed
+   - Timeout after `wait_time` seconds
+   - Document the actual API structure and parameters used
+
+3. **Validation**:
+   - New size must be larger than current size
+   - If attached to VM, verify VM is stopped
+
+### Testing Requirements
+- Integration test with test disk
+- Verify size increase works correctly
+- Test validation that prevents shrinking
+- Follow SailPoint test pattern
+
+### Definition of Done
+- [ ] Resize operation implemented for size changes only
+- [ ] Actual API structure researched and documented in code comments
+- [ ] Size validation prevents shrinking
+- [ ] VM state check if disk is attached
+- [ ] Polling works correctly
+- [ ] Integration tests passing
+
+---
+
+## TASK 11: Implement vm_is_locked Method
+
+**Task Category**: Advanced Features
+
+
+### Description
+Check if an Azure Local VM has resource locks (ReadOnly or CanNotDelete) that prevent destructive operations.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `vm_is_locked(self, vm_name: str, subscription_id: str, resource_group_name: str) -> bool`
+   - Returns `True` if any lock exists, `False` otherwise
+
+2. **Implementation Requirements**:
+   - GET locks on VM resource: `{vm_resource_id}/providers/Microsoft.Authorization/locks?api-version=2020-05-01`
+   - Check if any lock has `properties.level` in ['ReadOnly', 'CanNotDelete']
+   - Return `True` if matching lock found
+   - Return `False` if no locks or 404 response
+
+### Testing Requirements
+- Integration test with test VM
+- Verify lock detection works
+- Follow SailPoint test pattern
+
+### Definition of Done
+- [ ] Method checks for resource locks
+- [ ] Returns boolean correctly
+- [ ] Integration tests passing
+
+---
+
+## TASK 12: Implement delete_vm Method
+
+**Task Category**: Decommissioning Operations
+
+
+### Description
+Delete (remove) an Azure Local VM with manual polling of deletion status.
+
+**⚠️ IMPORTANT**: Do NOT execute the integration test for this method before code review. The test is marked as destructive and must be reviewed before running.
+
+### Acceptance Criteria
+1. **Method Signature**:
+   - `async delete_vm(self, vm_name: str, subscription_id: str, resource_group_name: str, wait_time: int = 600) -> None`
+   - Raises `HelperError` if VM is running
+
+2. **Implementation Requirements**:
+   - Verify VM is stopped before deletion
+   - DELETE to: `{resourceUri}/providers/Microsoft.AzureStackHCI/virtualMachineInstances/default?api-version=2024-01-01`
+   - Poll until GET returns 404 (deletion complete)
+   - Poll interval: 15 seconds
+   - Handle already-deleted VM (404) gracefully
+
+### Testing Requirements
+- Integration test with test VM (mark as `@pytest.mark.destructive` and `@pytest.mark.slow`)
+- Stop VM first, delete, verify deletion
+- **⚠️ DO NOT RUN THIS TEST BEFORE CODE REVIEW**: This test deletes a VM and must be reviewed before execution
+- Follow SailPoint test pattern
+
+### Definition of Done
+- [ ] Delete operation implemented
+- [ ] Pre-check prevents running VM deletion
+- [ ] Polling works correctly
+- [ ] Integration tests passing
+
+---
+
+## TASK 13: Update Integration Layer (credential_helpers.py)
+
+**Task Category**: Integration & Configuration
+
+
+### Description
+Add Azure Local helper initialization function to credential_helpers module for use by orchestrations.
+
+### Acceptance Criteria
+1. **File Location**: `sk_api/functions/utils/credential_helpers.py`
+
+2. **Function Implementation**:
+   - Add `azure_local_helper() -> AzureLocalHelper`
+   - Read credentials from environment variables:
+     - `AZURE_LOCAL_TENANT_ID`
+     - `AZURE_LOCAL_CLIENT_ID`
+     - `AZURE_LOCAL_CLIENT_SECRET`
+     - `AZURE_LOCAL_SUBSCRIPTION_ID` (default subscription)
+   - Return configured AzureLocalHelper instance
+   - Handle missing credentials gracefully
+
+3. **Import Statement**: Add import for `AzureLocalHelper` from `_automation_helpers.gsk_azure_local`
+
+### Testing Requirements
+- Integration test validates helper initialization
+- Follow SailPoint test pattern
+
+### Definition of Done
+- [ ] Function added to credential_helpers.py
+- [ ] Environment variables documented
+- [ ] Returns configured AzureLocalHelper instance
+- [ ] Integration tests passing
+
+---
+
+## Summary
+
+
+### Task Breakdown
+- TASK 1: Foundation (2 pts)
+- TASK 2: vm_exists (2 pts)
+- TASK 3: vm_exists_specific (2 pts)
+- TASK 4: get_vm_details (2 pts)
+- TASK 5: get_vm_details_specific (2 pts)
+- TASK 6: get_vm_power_state (2 pts)
+- TASK 7: start_vm (4 pts)
+- TASK 8: stop_vm (4 pts)
+- TASK 9: resize_vm (2 pts)
+- TASK 10: resize_disk (2 pts)
+- TASK 11: vm_is_locked (2 pts)
+- TASK 12: delete_vm (2 pts) ⚠️ **DO NOT RUN TEST BEFORE CODE REVIEW**
+- TASK 13: credential_helpers (1 pts)
+
+### Note on Integration
+Orchestration integration tasks (data models, workflow updates) will be provided in a separate task document after this helper class is completed.
+
+### Dependencies
+- All tasks depend on TASK 1 (Foundation)
+- TASK 7-12 depend on TASK 6 (power state)
+- TASK 10 (resize_disk) may depend on disk discovery from VM details
+- Integration tests require configured Azure Local environment with provided credentials
+- Test VMs: `name` and `name` in subscription `value', resource group `value`
+
+### Critical Notes
+- ⚠️ **TASK 12 (delete_vm)**: Integration test must NOT be executed before code review - it deletes actual VMs
+- All other integration tests are safe to run during development
+- Use both test VMs (`name` and `name`) to avoid conflicts between developers
